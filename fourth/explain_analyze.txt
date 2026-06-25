@@ -1,0 +1,59 @@
+### Порівняння EXPLAIN ANALYZE для бази даних таксі
+
+Тестовий запит:
+```sql
+EXPLAIN ANALYZE SELECT * FROM driver_status_logs 
+WHERE status_change = 'driver_active' 
+ORDER BY changed_at DESC 
+LIMIT 100;
+```
+
+---
+
+#### 1. до створення індексу (Паралельне послідовне сканування)
+
+```text
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=7621.30..7632.97 rows=100 width=220) (actual time=50.989..52.883 rows=100 loops=1)
+   ->  Gather Merge  (cost=7621.30..7709.51 rows=756 width=220) (actual time=50.988..52.873 rows=100 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Sort  (cost=6621.28..6622.23 rows=378 width=220) (actual time=41.186..41.192 rows=78 loops=3)
+               Sort Key: changed_at DESC
+               Sort Method: top-N heapsort  Memory: 49kB
+               Worker 0:  Sort Method: top-N heapsort  Memory: 47kB
+               Worker 1:  Sort Method: top-N heapsort  Memory: 49kB
+               ->  Parallel Seq Scan on driver_status_logs  (cost=0.00..6606.83 rows=378 width=220) (actual time=0.037..36.891 rows=41632 loops=3)
+                     Filter: ((status_change)::text = 'driver_active'::text)
+                     Rows Removed by Filter: 125035
+ Planning Time: 1.636 ms
+ Execution Time: 53.161 ms
+```
+
+Аналіз:
+PostgreSQL будує план із використанням паралельного послідовного сканування (Parallel Seq Scan) по всій таблиці на 500 000+ рядків, оскільки жоден індекс не відповідає умові фільтрації status_change = 'driver_active'. Для паралельного сканування розділів таблиці запускаються два фонових процеси (workers). Після цього використовується heapsort для сортування рядків, що відповідають критерію фільтра. Загальний час виконання становить 53.161 мс.
+
+---
+
+#### 2. після створення індексу (сканування за індексом)
+
+Доданий індекс:
+```sql
+CREATE INDEX idx_driver_status_logs_status_change_changed_at 
+ON driver_status_logs(status_change, changed_at DESC);
+```
+
+План виконання:
+```text
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..331.77 rows=100 width=220) (actual time=0.037..0.710 rows=100 loops=1)
+   ->  Index Scan using idx_driver_status_logs_status_change_changed_at on driver_status_logs  (cost=0.42..8284.17 rows=2500 width=220) (actual time=0.036..0.701 rows=100 loops=1)
+         Index Cond: ((status_change)::text = 'driver_active'::text)
+ Planning Time: 0.547 ms
+ Execution Time: 0.734 ms
+```
+
+Висновок:
+Завдяки композитному індексу PostgreSQL виконує сканування за індексом безпосередньо за вказаним фільтром. Чеерез те що індекс також містить поле changed_at DESC, рядки вже впорядковані всередині індексу. Це повністю прибирає етап сортування та дозволяє уникнути повного сканування таблиці. Час виконання суттєво зменшується у 72 рази
